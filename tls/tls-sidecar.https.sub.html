@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>TLS sidecar terminates TLS and forwards to wptserve</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+promise_test(async () => {
+  // {{ports[tls][0]}} is the sidecar's port, configured by `wpt serve
+  // --tls-server`. It terminates TLS (with the WPT cert) and forwards this
+  // request, as plaintext HTTP, to the wptserve HTTP listener.
+  const url = "https://{{host}}:{{ports[tls][0]}}/tls/resources/echo.py";
+  const response = await fetch(url);
+
+  assert_true(response.ok, "request through the TLS sidecar succeeds");
+  // The sidecar terminates both HTTP/1.1 and HTTP/2, translating h2 to h1
+  // toward wptserve, so the negotiated protocol depends on the browser.
+  assert_in_array(response.headers.get("x-negotiated-alpn"), ["h2", "http/1.1"]);
+  assert_true(
+    response.headers.get("x-negotiated-version").startsWith("TLSv1_"),
+    "the negotiated TLS version is reported back to the page");
+
+  // The sidecar rewrites the inbound scheme so the backend sees https.
+  const seen = await response.json();
+  assert_equals(seen["x-forwarded-proto"], "https");
+}, "the TLS sidecar terminates TLS, forwards to wptserve, and reports the negotiated parameters");
+</script>

@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Concurrent requests through the TLS sidecar</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// Exercises multiplexed streams when the connection negotiates h2, and
+// validates the sidecar's h2->h1 translation under concurrency.
+promise_test(async () => {
+  const urls = [1, 2, 3, 4].map(
+    (i) => `https://{{host}}:{{ports[tls][0]}}/tls/resources/echo.py?i=${i}`);
+  const responses = await Promise.all(urls.map((url) => fetch(url)));
+  for (const response of responses) {
+    assert_true(response.ok, "each concurrent request succeeds");
+    assert_in_array(response.headers.get("x-negotiated-alpn"), ["h2", "http/1.1"]);
+    const seen = await response.json();
+    assert_equals(seen["x-forwarded-proto"], "https");
+  }
+}, "concurrent requests are served through the sidecar with the https scheme forwarded");
+</script>

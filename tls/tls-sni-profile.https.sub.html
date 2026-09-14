@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A request to a specific SNI profile succeeds</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// The `tls13` subdomain selects the TLS 1.3-only profile on the sidecar.
+promise_test(async () => {
+  const url = "https://tls13.{{host}}:{{ports[tls][0]}}/tls/resources/echo.py";
+  const response = await fetch(url);
+
+  assert_true(response.ok, "request to the tls13 profile succeeds");
+  assert_equals(response.headers.get("x-negotiated-version"), "TLSv1_3");
+
+  const seen = await response.json();
+  assert_equals(seen["x-forwarded-proto"], "https");
+}, "the sidecar selects a TLS profile by SNI and forwards the https scheme");
+</script>

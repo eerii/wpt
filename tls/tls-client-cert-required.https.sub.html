@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A server that requires a client certificate rejects an anonymous client</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// The `cauth` subdomain selects a profile with client_auth: require. A browser
+// with no client certificate configured for this origin must fail the handshake.
+promise_test(async (t) => {
+  const url = "https://cauth.{{host}}:{{ports[tls][0]}}/tls/resources/echo.py";
+  await promise_rejects_js(t, TypeError, fetch(url));
+}, "a client-certificate-required profile rejects an anonymous client");
+</script>
