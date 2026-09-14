@@ -1,0 +1,27 @@
+[package]
+name = "wpt-tls-server"
+version = "0.1.0"
+edition = "2021"
+description = "PoC rustls sidecar that terminates TLS with declarative knobs and forwards plaintext HTTP to a backend"
+license = "BSD-3-Clause"
+
+[lib]
+name = "wpt_tls_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wpt-tls-server"
+path = "src/main.rs"
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+rcgen = "0.13"
