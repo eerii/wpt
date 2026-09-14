@@ -93,7 +93,7 @@ class TestEnvironment:
     websockets servers"""
     def __init__(self, test_paths, testharness_timeout_multipler,
                  pause_after_test, debug_test, debug_info, options, ssl_config, env_extras,
-                 enable_webtransport=None, enable_dns=None, mojojs_path=None, inject_script=None,
+                 enable_webtransport=None, enable_dns=None, enable_tls_server=None, mojojs_path=None, inject_script=None,
                  suppress_handler_traceback=None, ws_extra=None):
 
         self.test_paths = test_paths
@@ -127,6 +127,11 @@ class TestEnvironment:
             if enable_dns is not None
             else self.options.get("enable_dns", False)
         )
+        self.enable_tls_server = (
+            enable_tls_server
+            if enable_tls_server is not None
+            else self.options.get("enable_tls_server", False)
+        )
         self.mojojs_path = mojojs_path
         self.inject_script = inject_script
         self.suppress_handler_traceback = suppress_handler_traceback
@@ -157,7 +162,8 @@ class TestEnvironment:
                                    mp_context=mpcontext.get_context(),
                                    log_handlers=[server_log_handler],
                                    webtransport_h3=self.enable_webtransport,
-                                   dns=self.enable_dns)
+                                   dns=self.enable_dns,
+                                   tls_server=self.enable_tls_server)
 
         if self.options.get("supports_debugger") and self.debug_info and self.debug_info.interactive:
             self._stack.enter_context(self.ignore_interrupts())
@@ -205,6 +211,7 @@ class TestEnvironment:
             "h2": [9000],
             "webtransport-h3": [11000],
             "dns": [8053],
+            "tls": ["auto"],
         }
         config.ports = ports
 

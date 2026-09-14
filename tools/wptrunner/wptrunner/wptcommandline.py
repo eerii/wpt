@@ -174,6 +174,10 @@ scheme host and port.""")
                                       help="Enable the DNS server for resolving test domains")
     test_selection_group.add_argument("--no-enable-dns", action="store_false", dest="enable_dns",
                                       help="Do not enable DNS server")
+    test_selection_group.add_argument("--enable-tls-server",
+                                      action="store_true",
+                                      default=False,
+                                      help="Enable the Rust rustls TLS sidecar server")
     test_selection_group.add_argument("--tag", action="append", dest="tags",
                                       help="Labels applied to tests to include in the run. "
                                            "Labels starting dir: are equivalent to top-level directories.")
