@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A server that requires a client certificate rejects an anonymous client</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// The `www2` subdomain selects a profile with client_auth: require. A browser
+// with no client certificate configured for this origin must fail the handshake.
+promise_test(async (t) => {
+  // Only make the negative assertion when the harness trusts the WPT CA for
+  // these leaves; otherwise the failure would be certificate trust, not client
+  // authentication.
+  try {
+    await fetch("https://www.{{host}}:{{ports[tls][0]}}/tls/resources/echo.py?control");
+  } catch (error) {
+    throw new OptionalFeatureUnsupportedError(
+        "the harness does not trust the WPT CA for TLS profile certificates");
+  }
+
+  const url = "https://www2.{{host}}:{{ports[tls][0]}}/tls/resources/echo.py";
+  await promise_rejects_js(t, TypeError, fetch(url));
+}, "a client-certificate-required profile rejects an anonymous client");
+</script>

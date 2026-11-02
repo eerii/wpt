@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>The negotiated TLS/ALPN protocol is observable from the page</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+promise_test(async () => {
+  const url = "https://{{host}}:{{ports[tls][0]}}/tls/resources/echo.py";
+  const response = await fetch(url);
+
+  const reportedAlpn = response.headers.get("x-negotiated-alpn");
+  assert_in_array(reportedAlpn, ["h2", "http/1.1"]);
+  assert_true(
+    response.headers.get("x-negotiated-version").startsWith("TLSv1_"),
+    "the negotiated TLS version is reported back to the page");
+  await response.json();
+
+  // The browser's own view of the connection must agree with the server's.
+  const entries = performance.getEntriesByName(url, "resource");
+  assert_true(entries.length > 0, "a resource timing entry was recorded");
+  assert_equals(
+    entries[entries.length - 1].nextHopProtocol,
+    reportedAlpn,
+    "nextHopProtocol matches the ALPN the sidecar negotiated");
+}, "the negotiated ALPN/TLS version is observable via headers and Resource Timing");
+</script>

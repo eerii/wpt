@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="timeout" content="long">
+<title>Negative certificate profiles are rejected</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+promise_test(async (t) => {
+  // Positive control: only assert the negative cases when the harness trusts the
+  // WPT CA for the generated profile leaves. Chrome currently only trusts the
+  // pregenerated leaf, so it skips instead of passing for the wrong reason.
+  try {
+    await fetch("https://www.{{host}}:{{ports[tls][0]}}/tls/resources/echo.py?control");
+  } catch (error) {
+    throw new OptionalFeatureUnsupportedError(
+        "the harness does not trust the WPT CA for TLS profile certificates");
+  }
+
+  const urls = [
+    "https://{{hosts[alt][]}}:{{ports[tls][0]}}/tls/resources/echo.py?expired",
+    "https://{{hosts[alt][www]}}:{{ports[tls][0]}}/tls/resources/echo.py?notyet",
+    "https://{{hosts[alt][www1]}}:{{ports[tls][0]}}/tls/resources/echo.py?wronghost",
+    "https://{{hosts[alt][www2]}}:{{ports[tls][0]}}/tls/resources/echo.py?selfsigned",
+  ];
+  for (const url of urls) {
+    await promise_rejects_js(t, TypeError, fetch(url));
+  }
+}, "expired, not-yet-valid, wrong-host, and self-signed profiles are rejected");
+</script>

@@ -46,9 +46,10 @@ def get_parser():
     parser = argparse.ArgumentParser(
         parents=[channel_args],
         description="Install a given browser or webdriver frontend.")
-    parser.add_argument('browser', choices=['firefox', 'chrome', 'chromium', 'servo', 'safari', 'wktr'],
-                        help='name of web browser product')
-    parser.add_argument('component', choices=['browser', 'webdriver'],
+    parser.add_argument('browser', choices=['firefox', 'chrome', 'chromium', 'servo', 'safari', 'wktr', 'tls-server'],
+                        help='name of web browser product, or the TLS test server')
+    parser.add_argument('component', nargs='?', default='browser',
+                        choices=['browser', 'webdriver'],
                         help='name of component')
     parser.add_argument('--download-only', action="store_true",
                         help="Download the selected component but don't install it")
@@ -75,17 +76,21 @@ def run(venv, **kwargs):
 
     browser = kwargs["browser"]
     destination = kwargs["destination"]
-    channel = get_channel(browser, kwargs["channel"])
 
-    if channel != kwargs["channel"]:
-        logger.info("Interpreting channel '%s' as '%s'", kwargs["channel"], channel)
+    if browser == "tls-server":
+        channel = None
+    else:
+        channel = get_channel(browser, kwargs["channel"])
+
+        if channel != kwargs["channel"]:
+            logger.info("Interpreting channel '%s' as '%s'", kwargs["channel"], channel)
 
     if destination is None:
         if venv:
-            if kwargs["component"] == "browser":
-                destination = venv.path
-            else:
+            if browser == "tls-server" or kwargs["component"] == "webdriver":
                 destination = venv.bin_path
+            else:
+                destination = venv.path
         else:
             raise argparse.ArgumentError(None,
                                          "No --destination argument, and no default for the environment")
@@ -103,6 +108,13 @@ def install(name, component, destination, channel="nightly", logger=None, downlo
     if logger is None:
         import logging
         logger = logging.getLogger("install")
+
+    if name == "tls-server":
+        from . import tls_server
+        logger.info('Now installing tls-server...')
+        path = tls_server.install(dest=destination, logger=logger)
+        logger.info('Binary installed as %s', path)
+        return path
 
     prefix = "download" if download_only else "install"
     suffix = "_webdriver" if component == 'webdriver' else ""
