@@ -1,0 +1,46 @@
+{
+  "default_profile": "tls13",
+  "profiles": {
+    "tls13": {
+      "cert": "tls13.pem",
+      "key": "tls13.key",
+      "min_version": "1.3",
+      "max_version": "1.3",
+      "alpn": ["h2", "http/1.1"]
+    },
+    "tls12": {
+      "cert": "tls12.pem",
+      "key": "tls12.key",
+      "min_version": "1.2",
+      "max_version": "1.2",
+      "alpn": ["h2", "http/1.1"]
+    },
+    "cauth": {
+      "cert": "cauth.pem",
+      "key": "cauth.key",
+      "alpn": ["h2", "http/1.1"],
+      "client_auth": "require",
+      "client_ca": "../cacert.pem"
+    },
+    "expired": {
+      "cert": "expired.pem",
+      "key": "expired.key",
+      "alpn": ["h2", "http/1.1"]
+    },
+    "notyet": {
+      "cert": "notyet.pem",
+      "key": "notyet.key",
+      "alpn": ["h2", "http/1.1"]
+    },
+    "wronghost": {
+      "cert": "wronghost.pem",
+      "key": "wronghost.key",
+      "alpn": ["h2", "http/1.1"]
+    },
+    "selfsigned": {
+      "cert": "selfsigned.pem",
+      "key": "selfsigned.key",
+      "alpn": ["h2", "http/1.1"]
+    }
+  }
+}
