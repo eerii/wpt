@@ -98,7 +98,8 @@ class TestEnvironment:
     websockets servers"""
     def __init__(self, test_paths, testharness_timeout_multipler,
                  pause_after_test, debug_test, debug_info, options, ssl_config, env_extras,
-                 enable_webtransport=None, enable_dns=None, mojojs_path=None, inject_script=None,
+                 enable_webtransport=None, enable_dns=None, enable_tls_server=None,
+                 mojojs_path=None, inject_script=None,
                  suppress_handler_traceback=None, ws_extra=None, logger=None,
                  enable_websocket_h3=None):
 
@@ -137,6 +138,11 @@ class TestEnvironment:
             if enable_dns is not None
             else self.options.get("enable_dns", False)
         )
+        self.enable_tls_server = (
+            enable_tls_server
+            if enable_tls_server is not None
+            else self.options.get("enable_tls_server", False)
+        )
         self.mojojs_path = mojojs_path
         self.inject_script = inject_script
         self.suppress_handler_traceback = suppress_handler_traceback
@@ -170,7 +176,8 @@ class TestEnvironment:
                                    log_handlers=[server_log_handler],
                                    webtransport_h3=self.enable_webtransport,
                                    websocket_h3=self.enable_websocket_h3,
-                                   dns=self.enable_dns)
+                                   dns=self.enable_dns,
+                                   tls_server=self.enable_tls_server)
 
         if self.options.get("supports_debugger") and self.debug_info and self.debug_info.interactive:
             self._stack.enter_context(self.ignore_interrupts())
@@ -220,8 +227,10 @@ class TestEnvironment:
             "websocket-h3": [11001],
             "websocket-h3-https": [11001],
             "dns": [8053],
+            "tls": ["auto"],
         }
         config.ports = ports
+        config.forwarded_proto = self.enable_tls_server
 
         if os.path.exists(override_path):
             with open(override_path) as f:
