@@ -975,6 +975,15 @@ def setup_wptrunner(venv, **kwargs):
 
         venv.install_requirements(*requirements)
 
+    if kwargs.get("enable_tls_server"):
+        from . import tls_server
+        binary = tls_server.ensure_installed(venv=venv, prompt=kwargs["prompt"], logger=logger)
+        if binary:
+            # Inherited by the server subprocesses.
+            os.environ.setdefault("WPT_TLS_SERVER", binary)
+        else:
+            logger.warning("wpt-tls-server unavailable; TLS tests will be skipped")
+
     affected_revish = kwargs.get("affected")
     if affected_revish is not None:
         files_changed, _ = testfiles.files_changed(
