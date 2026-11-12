@@ -2,6 +2,7 @@
 
 import abc
 import argparse
+import collections
 import html
 import importlib
 import json
@@ -9,8 +10,10 @@ import logging
 import multiprocessing
 import os
 import platform
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -1194,6 +1197,11 @@ def start_servers(logger, host, ports, paths, routes, bind_address, config,
             logging.info("DNS server disabled")
             continue
 
+        # Skip the Rust TLS sidecar unless it is enabled explicitly.
+        if scheme == "tls" and not kwargs.get("tls_server"):
+            logger.info("TLS sidecar disabled")
+            continue
+
         for port in ports:
             if port is None:
                 continue
@@ -1212,6 +1220,7 @@ def start_servers(logger, host, ports, paths, routes, bind_address, config,
                 "websocket-h3": start_websocket_h3_server,
                 "websocket-h3-https": start_websocket_h3_https_server,
                 "dns": start_dns_server,
+                "tls": start_tls_server,
             }[scheme]
 
             server_proc = ServerProc(mp_context, scheme=scheme)
@@ -1425,6 +1434,142 @@ def start_websocket_h3_server(logger, host, port, paths, routes, bind_address, c
     except Exception as error:
         logger.critical(f"Failed to start WebSocket over HTTP/3 server: {error}")
         startup_failed(logger)
+def load_tls_profiles(path, ssl_config):
+    """Read the declarative profile matrix, or fall back to the harness leaf.
+
+    Profile paths are relative to the matrix file. The fallback keeps the
+    sidecar usable when the generated matrix is absent, in which case only the
+    pregenerated certificate is trusted by the browser.
+    """
+    try:
+        with open(path) as profiles_file:
+            matrix = json.load(profiles_file)
+    except (OSError, ValueError):
+        return {
+            "tls13": {"cert": ssl_config["cert_path"],
+                      "key": ssl_config["key_path"],
+                      "alpn": ["h2", "http/1.1"]},
+        }, "tls13"
+
+    base = os.path.dirname(path)
+    profiles = {}
+    for name, profile in matrix.get("profiles", {}).items():
+        profile = dict(profile)
+        for key in ("cert", "key", "client_ca"):
+            if key in profile:
+                profile[key] = os.path.normpath(os.path.join(base, profile[key]))
+        profiles[name] = profile
+    return profiles, matrix.get("default_profile", "tls13")
+
+
+def tls_profile_names():
+    try:
+        with open(os.path.join(repo_root, "tools", "certs", "tls", "profiles.json")) as f:
+            return set(json.load(f).get("profiles", {}))
+    except (OSError, ValueError):
+        return set()
+
+
+class TlsServerDaemon:
+    """Runs the Rust rustls sidecar as a subprocess."""
+
+    def __init__(self, logger, port, binary, config_path):
+        self.logger = logger
+        self.port = port
+        self.binary = binary
+        self.config_path = config_path
+        self.proc = None
+        self._stderr_tail = collections.deque(maxlen=10)
+
+    def start(self):
+        self.proc = subprocess.Popen([self.binary, "--config", self.config_path],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE,
+                                     text=True,
+                                     errors="replace")
+        threading.Thread(target=self._log_stderr, daemon=True).start()
+        try:
+            self._wait_until_ready()
+        except OSError:
+            self.stop()
+            raise
+
+    def _log_stderr(self):
+        for line in self.proc.stderr:
+            line = line.rstrip()
+            if line:
+                self._stderr_tail.append(line)
+                self.logger.debug("wpt-tls-server: %s", line)
+
+    def _wait_until_ready(self):
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise OSError("wpt-tls-server exited before listening: %s" %
+                              (self._stderr_tail[-1] if self._stderr_tail else "no output"))
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
+                    return
+            except OSError:
+                time.sleep(0.05)
+        raise OSError("wpt-tls-server did not become ready: %s" %
+                      (self._stderr_tail[-1] if self._stderr_tail else "no output"))
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                os.unlink(self.config_path)
+            except OSError:
+                pass
+
+
+def start_tls_server(logger, host, port, paths, routes, bind_address, config, **kwargs):
+    binary = kwargs.get("tls_server_binary") or os.environ.get("WPT_TLS_SERVER")
+    if not binary:
+        try:
+            from tools.wpt import tls_server as tls_install
+            binary = tls_install.find()
+        except Exception as error:
+            logger.warning("Could not resolve wpt-tls-server: %s", error)
+            binary = None
+    if not binary:
+        binary = os.path.join(repo_root, "tools", "tls", "target", "release", "wpt-tls-server")
+    if not os.path.exists(binary):
+        logger.warning("TLS sidecar binary not found at %s; skipping", binary)
+        return None
+    ssl_config = config.ssl_config
+    if not ssl_config or not ssl_config.get("cert_path"):
+        logger.warning("TLS sidecar requires TLS certificates; skipping")
+        return None
+
+    http_port = config.ports["http"][0]
+    certs_dir = os.path.join(repo_root, "tools", "certs", "tls")
+    profiles_path = os.path.join(certs_dir, "profiles.json")
+
+    profiles, default_profile = load_tls_profiles(profiles_path, ssl_config)
+    if not profiles:
+        logger.warning("no TLS profiles in %s; skipping", profiles_path)
+        return None
+
+    sidecar_config = {
+        "listeners": [{
+            "listen": "127.0.0.1:%d" % port,
+            "backend": "127.0.0.1:%d" % http_port,
+            "provider": "aws-lc-rs",
+            "default_profile": default_profile,
+            "profiles": profiles,
+        }]
+    }
+    fd, config_path = tempfile.mkstemp(prefix="wpt-tls-", suffix=".json")
+    with os.fdopen(fd, "w") as config_file:
+        json.dump(sidecar_config, config_file)
+    return TlsServerDaemon(logger, port, binary, config_path)
 
 
 def start_dns_server(logger, host, port, paths, routes, bind_address, config, **kwargs):
@@ -1474,6 +1619,10 @@ _not_subdomains = {"nonexistent"}
 
 _subdomains = _make_subdomains_product(_subdomains)
 
+# The sidecar's SNI profile names are subdomains, so the browser resolves them
+# (via wptrunner's network.dns.localDomains) and they appear in hosts files.
+_subdomains |= tls_profile_names()
+
 _not_subdomains = _make_subdomains_product(_not_subdomains)
 
 
@@ -1505,6 +1654,7 @@ class ConfigBuilder(config.ConfigBuilder):
             "webtransport-h3": ["auto"],
             "websocket-h3": ["auto"],
             "dns": [8053],
+            "tls": ["auto"],
         },
         "check_subdomains": True,
         "bind_address": True,
@@ -1527,6 +1677,7 @@ class ConfigBuilder(config.ConfigBuilder):
             "none": {}
         },
         "aliases": [],
+        "forwarded_proto": False,
         "logging": {
             "level": "info",
             "suppress_handler_traceback": False
@@ -1596,6 +1747,9 @@ def build_config(logger, override_path=None, config_cls=ConfigBuilder, **kwargs)
     if kwargs.get("verbose"):
         rv.logging["level"] = "DEBUG"
 
+    # Only the TLS sidecar forwards plaintext on behalf of an https origin.
+    rv.forwarded_proto = bool(kwargs.get("tls_server"))
+
     setattr(rv, "inject_script", kwargs.get("inject_script"))
 
     overriding_path_args = [("doc_root", "Document root"),
@@ -1641,6 +1795,10 @@ def get_parser():
                         help="Enable DNS server")
     parser.add_argument("--dns-wildcards", type=int, metavar="N",
                         help="Provide wildcards for N levels of subdomains")
+    parser.add_argument("--tls-server", action="store_true",
+                        help="Enable the Rust rustls TLS sidecar")
+    parser.add_argument("--yes", "-y", dest="prompt", action="store_false", default=True,
+                        help="Don't prompt before installing components")
     parser.add_argument("--exit-after-start", action="store_true",
                         help="Exit after starting servers")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
@@ -1712,6 +1870,23 @@ def run(venv=None, config_cls=ConfigBuilder, route_builder=None,
 
         if config["check_subdomains"]:
             check_subdomains(logger, config, routes, mp_context, log_handlers)
+
+        if kwargs.get("tls_server"):
+            # Resolve/install the sidecar in the parent so the child processes
+            # (which inherit the environment) can just find it.
+            try:
+                from tools.wpt import tls_server as tls_install
+                binary = tls_install.ensure_installed(venv=venv,
+                                                      prompt=kwargs.get("prompt", True),
+                                                      logger=logger)
+            except Exception as error:
+                logger.warning("Could not resolve wpt-tls-server: %s", error)
+                binary = None
+            if binary:
+                os.environ.setdefault("WPT_TLS_SERVER", binary)
+                kwargs["tls_server_binary"] = binary
+            else:
+                logger.warning("wpt-tls-server unavailable; TLS tests will be skipped")
 
         stash_address = None
         if bind_address:
