@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
+use std::future::Future;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -19,6 +20,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bytes::Bytes;
+use h2::server::SendResponse;
+use h2::{RecvStream, SendStream};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{Acceptor, WebPkiClientVerifier};
@@ -701,175 +704,336 @@ fn suite_name(suite: &rustls::SupportedCipherSuite) -> String {
     format!("{:?}", suite.suite())
 }
 
-/// HTTP/2 termination: accept h2 streams and serve each one as an HTTP/1.1
-/// request against the backend, then translate the response back to h2.
-///
-/// The `h2` state machine is driven with `pollster::block_on` over a small
-/// adapter that performs the (blocking) rustls I/O from `poll_read`/`poll_write`
-/// on the connection's own thread. This is adequate for test traffic; a
-/// production version would likely use a tokio runtime.
+/// HTTP/2 termination: one non-blocking event loop serves every stream on the
+/// connection, translating each request to HTTP/1.1 against the backend and
+/// streaming the response back as it arrives.
 fn serve_h2(tls: StreamOwned<ServerConnection, TcpStream>, backend: &str) -> io::Result<()> {
     tls.sock.set_nonblocking(true)?;
     let negotiated = negotiated_params(&tls);
-    let mut conn: h2::server::Connection<_, Bytes> =
+    let waker = std::task::Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    let mut connection: h2::server::Connection<_, Bytes> =
         drive(h2::server::handshake(BlockingIo(tls))).map_err(io::Error::other)?;
-    while let Some(request) = drive(conn.accept()) {
-        let (request, respond) = request.map_err(io::Error::other)?;
-        if let Err(err) = handle_h2_stream(request, respond, backend, &negotiated) {
-            eprintln!("wpt-tls-server: h2 stream error: {err}");
+    let mut streams: Vec<H2Stream> = Vec::new();
+    loop {
+        let mut progressed = false;
+        let accepted = {
+            let mut accept = std::pin::pin!(connection.accept());
+            accept.as_mut().poll(&mut context)
+        };
+        match accepted {
+            Poll::Ready(Some(Ok((request, respond)))) => {
+                streams.push(H2Stream::new(request, respond, backend, &negotiated));
+                progressed = true;
+            }
+            Poll::Ready(Some(Err(err))) => return Err(io::Error::other(err)),
+            Poll::Ready(None) => return Ok(()),
+            Poll::Pending => {}
+        }
+        streams.retain_mut(|stream| match stream.poll(&mut context) {
+            Step::Progress => {
+                progressed = true;
+                true
+            }
+            Step::Idle => true,
+            Step::Done => false,
+        });
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
         }
     }
-    Ok(())
 }
 
-/// Minimal executor for the h2 futures: poll, and on `Pending` sleep briefly and
-/// re-poll. Combined with the non-blocking adapter below, this lets h2's
-/// read-ahead return control so `accept()` can hand back queued streams.
-fn drive<F: std::future::Future>(future: F) -> F::Output {
-    struct NoopWake;
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
+struct NoopWake;
+
+impl std::task::Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+/// Minimal executor for the h2 handshake future and the per-stream body reads:
+/// poll, and on `Pending` sleep briefly and re-poll.
+fn drive<F: Future>(future: F) -> F::Output {
     let waker = std::task::Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let mut context = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
     loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
             return value;
         }
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn declares_body(headers: &http::HeaderMap) -> bool {
-    let length = headers
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim() != "0" && !value.trim().is_empty())
-        .unwrap_or(false);
-    length || headers.contains_key(http::header::TRANSFER_ENCODING)
+enum Step {
+    Progress,
+    Idle,
+    Done,
 }
 
-fn handle_h2_stream(
-    request: http::Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<Bytes>,
-    backend: &str,
-    negotiated: &(String, String, String),
-) -> io::Result<()> {
-    let (parts, _body) = request.into_parts();
-    if declares_body(&parts.headers) {
-        // One stream at a time: a request body cannot be interleaved with the
-        // backend response yet, so say so instead of dropping it.
-        let response = http::Response::builder()
-            .status(501)
-            .header("x-negotiated-version", &negotiated.0)
-            .header("x-negotiated-cipher", &negotiated.1)
-            .header("x-negotiated-alpn", &negotiated.2)
-            .body(())
-            .map_err(io::Error::other)?;
-        let mut stream = respond
-            .send_response(response, true)
-            .map_err(io::Error::other)?;
-        let _ = stream.send_data(Bytes::from_static(b"request bodies need HTTP/1.1\n"), true);
-        return Ok(());
-    }
-    let authority = parts
-        .uri
-        .authority()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "localhost".to_string());
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+enum Phase {
+    Read,
+    Write,
+    Head,
+    Body,
+}
 
-    let mut h1 = format!("{} {} HTTP/1.1\r\n", parts.method, path);
-    let mut has_host = false;
-    for (name, value) in parts.headers.iter() {
-        let name = name.as_str();
-        if name.starts_with(':') || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("host") {
-            has_host = true;
-        }
-        h1.push_str(&format!("{name}: {}\r\n", value.to_str().unwrap_or("")));
-    }
-    if !has_host {
-        h1.push_str(&format!("Host: {authority}\r\n"));
-    }
-    h1.push_str("X-Forwarded-Proto: https\r\nConnection: close\r\n\r\n");
+struct H2Stream {
+    parts: http::request::Parts,
+    body: RecvStream,
+    body_bytes: Vec<u8>,
+    request: Vec<u8>,
+    written: usize,
+    backend_address: String,
+    backend: Option<TcpStream>,
+    received: Vec<u8>,
+    respond: SendResponse<Bytes>,
+    send: Option<SendStream<Bytes>>,
+    negotiated: (String, String, String),
+    phase: Phase,
+}
 
-    let mut backend_stream = match TcpStream::connect(backend) {
-        Ok(stream) => stream,
-        Err(err) => {
-            eprintln!("wpt-tls-server: backend connect failed: {err}");
-            let response = http::Response::builder()
-                .status(502)
-                .body(())
-                .map_err(io::Error::other)?;
-            respond
-                .send_response(response, true)
-                .map_err(io::Error::other)?;
-            return Ok(());
+impl H2Stream {
+    fn new(
+        request: http::Request<RecvStream>,
+        respond: SendResponse<Bytes>,
+        backend: &str,
+        negotiated: &(String, String, String),
+    ) -> H2Stream {
+        let (parts, body) = request.into_parts();
+        H2Stream {
+            parts,
+            body,
+            body_bytes: Vec::new(),
+            request: Vec::new(),
+            written: 0,
+            backend_address: backend.to_string(),
+            backend: None,
+            received: Vec::new(),
+            respond,
+            send: None,
+            negotiated: negotiated.clone(),
+            phase: Phase::Read,
         }
-    };
-    backend_stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
-    backend_stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
-    backend_stream.write_all(h1.as_bytes())?;
+    }
 
-    let head = read_head(&mut backend_stream)?;
-    let text = String::from_utf8_lossy(&head);
-    let mut lines = text.split("\r\n");
-    let status = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(502);
-    let mut builder = http::Response::builder().status(status);
-    for line in lines {
-        if line.is_empty() {
-            break;
+    fn poll(&mut self, cx: &mut Context<'_>) -> Step {
+        match self.phase {
+            Phase::Read => self.read_body(cx),
+            Phase::Write => self.write_request(),
+            Phase::Head => self.read_response_head(),
+            Phase::Body => self.stream_body(),
         }
-        if let Some((key, value)) = line.split_once(':') {
-            let lower = key.trim().to_ascii_lowercase();
+    }
+
+    fn read_body(&mut self, cx: &mut Context<'_>) -> Step {
+        let next = {
+            let mut data = std::pin::pin!(self.body.data());
+            match data.as_mut().poll(cx) {
+                Poll::Ready(next) => next,
+                Poll::Pending => return Step::Idle,
+            }
+        };
+        match next {
+            Some(Ok(chunk)) => {
+                self.body_bytes.extend_from_slice(&chunk);
+                Step::Progress
+            }
+            Some(Err(err)) => self.fail(&format!("request body: {err}")),
+            None => self.start_backend(),
+        }
+    }
+
+    fn start_backend(&mut self) -> Step {
+        let authority = self
+            .parts
+            .uri
+            .authority()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "localhost".to_string());
+        let path = self
+            .parts
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+
+        let mut head = format!("{} {} HTTP/1.1\r\n", self.parts.method, path);
+        let mut has_host = false;
+        for (name, value) in self.parts.headers.iter() {
+            let name = name.as_str();
+            if name.eq_ignore_ascii_case("host") {
+                has_host = true;
+            }
             if matches!(
-                lower.as_str(),
+                name.to_ascii_lowercase().as_str(),
                 "connection" | "content-length" | "transfer-encoding" | "keep-alive"
             ) {
                 continue;
             }
-            builder = builder.header(key.trim(), value.trim());
+            head.push_str(&format!("{name}: {}\r\n", value.to_str().unwrap_or("")));
         }
-    }
-    builder = builder.header("x-negotiated-version", &negotiated.0);
-    builder = builder.header("x-negotiated-cipher", &negotiated.1);
-    builder = builder.header("x-negotiated-alpn", &negotiated.2);
-    let response = builder.body(()).map_err(io::Error::other)?;
+        if !has_host {
+            head.push_str(&format!("Host: {authority}\r\n"));
+        }
+        if !self.body_bytes.is_empty() {
+            head.push_str(&format!("Content-Length: {}\r\n", self.body_bytes.len()));
+        }
+        head.push_str("X-Forwarded-Proto: https\r\nConnection: close\r\n\r\n");
+        self.request = head.into_bytes();
+        self.request.extend_from_slice(&self.body_bytes);
 
-    let mut stream = respond
-        .send_response(response, false)
-        .map_err(io::Error::other)?;
-    let mut buffer = vec![0u8; COPY_CHUNK];
-    loop {
-        let read = backend_stream.read(&mut buffer)?;
-        if read == 0 {
-            break;
+        let backend = match TcpStream::connect(&self.backend_address) {
+            Ok(backend) => backend,
+            Err(err) => {
+                eprintln!("wpt-tls-server: backend connect failed: {err}");
+                return self.send_bad_gateway();
+            }
+        };
+        if let Err(err) = backend.set_nonblocking(true) {
+            return self.fail(&format!("backend: {err}"));
         }
-        stream
-            .send_data(Bytes::copy_from_slice(&buffer[..read]), false)
-            .map_err(io::Error::other)?;
+        self.backend = Some(backend);
+        self.phase = Phase::Write;
+        Step::Progress
     }
-    stream
-        .send_data(Bytes::new(), true)
-        .map_err(io::Error::other)?;
-    Ok(())
+
+    fn write_request(&mut self) -> Step {
+        let Some(backend) = self.backend.as_mut() else {
+            return Step::Done;
+        };
+        let result = backend.write(&self.request[self.written..]);
+        match result {
+            Ok(0) => self.fail("backend closed while writing the request"),
+            Ok(wrote) => {
+                self.written += wrote;
+                if self.written == self.request.len() {
+                    self.phase = Phase::Head;
+                }
+                Step::Progress
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Step::Idle,
+            Err(err) => self.fail(&format!("backend write: {err}")),
+        }
+    }
+
+    fn read_response_head(&mut self) -> Step {
+        if let Some(end) = self.received.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = self.received.drain(..end + 4).collect::<Vec<u8>>();
+            return self.send_response_head(&head);
+        }
+        let Some(backend) = self.backend.as_mut() else {
+            return Step::Done;
+        };
+        let mut buffer = [0u8; COPY_CHUNK];
+        let result = backend.read(&mut buffer);
+        match result {
+            Ok(0) => self.fail("backend closed before the response head"),
+            Ok(read) => {
+                self.received.extend_from_slice(&buffer[..read]);
+                if self.received.len() > MAX_HEAD_BYTES {
+                    return self.fail("response head exceeds 64 KiB");
+                }
+                Step::Progress
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Step::Idle,
+            Err(err) => self.fail(&format!("backend read: {err}")),
+        }
+    }
+
+    fn send_response_head(&mut self, head: &[u8]) -> Step {
+        let text = String::from_utf8_lossy(head);
+        let mut lines = text.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(502);
+        let mut builder = http::Response::builder().status(status);
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "connection" | "content-length" | "transfer-encoding" | "keep-alive"
+            ) {
+                continue;
+            }
+            builder = builder.header(name, value.trim());
+        }
+        let builder = builder
+            .header("x-negotiated-version", &self.negotiated.0)
+            .header("x-negotiated-cipher", &self.negotiated.1)
+            .header("x-negotiated-alpn", &self.negotiated.2);
+        let Ok(response) = builder.body(()) else {
+            return self.fail("invalid response head from the backend");
+        };
+        match self.respond.send_response(response, false) {
+            Ok(send) => {
+                self.send = Some(send);
+                self.phase = Phase::Body;
+                Step::Progress
+            }
+            Err(err) => self.fail(&format!("h2 response: {err}")),
+        }
+    }
+
+    fn stream_body(&mut self) -> Step {
+        if self.received.is_empty() {
+            let Some(backend) = self.backend.as_mut() else {
+                return Step::Done;
+            };
+            let mut buffer = [0u8; COPY_CHUNK];
+            let result = backend.read(&mut buffer);
+            match result {
+                Ok(0) => return self.finish_body(),
+                Ok(read) => self.received.extend_from_slice(&buffer[..read]),
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => return Step::Idle,
+                Err(err) => return self.fail(&format!("backend read: {err}")),
+            }
+        }
+        let take = self.received.len().min(COPY_CHUNK);
+        let chunk = Bytes::from(self.received.drain(..take).collect::<Vec<u8>>());
+        let Some(send) = self.send.as_mut() else {
+            return Step::Done;
+        };
+        match send.send_data(chunk, false) {
+            Ok(()) => Step::Progress,
+            Err(err) => self.fail(&format!("h2 data: {err}")),
+        }
+    }
+
+    fn finish_body(&mut self) -> Step {
+        let Some(send) = self.send.as_mut() else {
+            return Step::Done;
+        };
+        match send.send_data(Bytes::new(), true) {
+            Ok(()) => Step::Done,
+            Err(err) => self.fail(&format!("h2 data: {err}")),
+        }
+    }
+
+    fn send_bad_gateway(&mut self) -> Step {
+        let mut response = http::Response::new(());
+        *response.status_mut() = http::StatusCode::BAD_GATEWAY;
+        match self.respond.send_response(response, true) {
+            Ok(_) => Step::Done,
+            Err(err) => self.fail(&format!("h2 response: {err}")),
+        }
+    }
+
+    fn fail(&self, message: &str) -> Step {
+        eprintln!("wpt-tls-server: h2 stream: {message}");
+        Step::Done
+    }
 }
 
 /// Adapter that gives the `h2` state machine tokio's async I/O traits backed by
-/// the blocking rustls stream. Blocking in `poll_*` is safe here because each
-/// connection runs on its own thread and is driven with `pollster::block_on`.
+/// the rustls stream on the connection's own thread, where `poll_*` may block.
 struct BlockingIo<T>(T);
 
 impl<T: Read + Unpin> AsyncRead for BlockingIo<T> {
