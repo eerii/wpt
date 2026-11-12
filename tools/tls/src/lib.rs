@@ -292,45 +292,72 @@ fn negotiated_params(tls: &StreamOwned<ServerConnection, TcpStream>) -> (String,
 }
 
 fn proxy_h1(tls: &mut StreamOwned<ServerConnection, TcpStream>, backend: &str) -> io::Result<()> {
-    let head = read_head(tls)?;
-    if head.is_empty() {
-        return Ok(());
-    }
-    let request = rewrite_request_head(&head);
+    loop {
+        let head = read_head(tls)?;
+        if head.is_empty() {
+            return Ok(());
+        }
+        let request = rewrite_request_head(&head);
 
-    let mut backend_stream = match TcpStream::connect(backend) {
-        Ok(stream) => stream,
-        Err(err) => {
-            eprintln!("wpt-tls-server: backend connect failed: {err}");
+        let mut backend_stream = match TcpStream::connect(backend) {
+            Ok(stream) => stream,
+            Err(err) => {
+                eprintln!("wpt-tls-server: backend connect failed: {err}");
+                return send_bad_gateway(tls);
+            }
+        };
+        backend_stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
+        backend_stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
+        backend_stream.write_all(&request.bytes)?;
+
+        if request.expect_continue {
+            tls.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            tls.flush()?;
+        }
+        match request.body {
+            Body::None => {}
+            Body::Length(length) => {
+                io::copy(&mut (&mut *tls).take(length), &mut backend_stream)?;
+            }
+            Body::Chunked => copy_chunked(&mut *tls, &mut backend_stream)?,
+        }
+
+        let response_head = read_head(&mut backend_stream)?;
+        if response_head.is_empty() {
             return send_bad_gateway(tls);
         }
-    };
-    backend_stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
-    backend_stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
-    backend_stream.write_all(&request.bytes)?;
-
-    if request.expect_continue {
-        tls.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        let framing = response_framing(&response_head, request.is_head);
+        let keep_alive = request.keep_alive && framing != Framing::Eof;
+        let response_head = rewrite_response_head(tls, &response_head, keep_alive);
+        tls.write_all(&response_head)?;
+        relay_body(&framing, &mut backend_stream, tls)?;
         tls.flush()?;
-    }
-    match request.body {
-        Body::None => {}
-        Body::Length(length) => {
-            io::copy(&mut (&mut *tls).take(length), &mut backend_stream)?;
-        }
-        Body::Chunked => copy_chunked(&mut *tls, &mut backend_stream)?,
-    }
 
-    let response_head = read_head(&mut backend_stream)?;
-    if response_head.is_empty() {
-        return send_bad_gateway(tls);
+        if !keep_alive {
+            tls.conn.send_close_notify();
+            tls.flush()?;
+            return Ok(());
+        }
     }
-    let response_head = inject_negotiated_headers(tls, &response_head);
-    tls.write_all(&response_head)?;
-    io::copy(&mut backend_stream, tls)?;
-    tls.conn.send_close_notify();
-    tls.flush()?;
-    Ok(())
+}
+
+fn relay_body<R: Read, W: Write>(
+    framing: &Framing,
+    backend: &mut R,
+    client: &mut W,
+) -> io::Result<()> {
+    match framing {
+        Framing::None => Ok(()),
+        Framing::Length(length) => {
+            io::copy(&mut backend.take(*length), client)?;
+            Ok(())
+        }
+        Framing::Chunked => copy_chunked(backend, client),
+        Framing::Eof => {
+            io::copy(backend, client)?;
+            Ok(())
+        }
+    }
 }
 
 fn copy_chunked<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
@@ -415,6 +442,16 @@ struct RequestHead {
     bytes: Vec<u8>,
     body: Body,
     expect_continue: bool,
+    keep_alive: bool,
+    is_head: bool,
+}
+
+#[derive(PartialEq)]
+enum Framing {
+    None,
+    Length(u64),
+    Chunked,
+    Eof,
 }
 
 fn rewrite_request_head(head: &[u8]) -> RequestHead {
@@ -423,13 +460,18 @@ fn rewrite_request_head(head: &[u8]) -> RequestHead {
     let request_line = lines.next().unwrap_or("");
     let mut body = Body::None;
     let mut expect_continue = false;
+    let mut close = false;
     let mut forwarded = String::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("x-forwarded-proto:") || lower.starts_with("connection:") {
+        if lower.starts_with("x-forwarded-proto:") {
+            continue;
+        }
+        if let Some(value) = lower.strip_prefix("connection:") {
+            close = value.contains("close");
             continue;
         }
         if let Some(value) = lower.strip_prefix("content-length:") {
@@ -452,28 +494,103 @@ fn rewrite_request_head(head: &[u8]) -> RequestHead {
     bytes.extend_from_slice(forwarded.as_bytes());
     bytes.extend_from_slice(b"X-Forwarded-Proto: https\r\n");
     bytes.extend_from_slice(b"Connection: close\r\n\r\n");
+    let is_head = request_line
+        .split_whitespace()
+        .next()
+        .map(|method| method.eq_ignore_ascii_case("HEAD"))
+        .unwrap_or(false);
     RequestHead {
         bytes,
         body,
         expect_continue,
+        keep_alive: request_line.ends_with("HTTP/1.1") && !close,
+        is_head,
     }
 }
 
-fn inject_negotiated_headers(
+fn response_framing(head: &[u8], is_head: bool) -> Framing {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let status = lines.next().unwrap_or("");
+    let code = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    if is_head || code == 204 || code == 304 {
+        return Framing::None;
+    }
+    let mut length = None;
+    let mut chunked = false;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            length = value.trim().parse().ok();
+        } else if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+            chunked = chunked || value.contains("chunked");
+        }
+    }
+    if chunked {
+        Framing::Chunked
+    } else if let Some(length) = length {
+        Framing::Length(length)
+    } else {
+        Framing::Eof
+    }
+}
+
+fn rewrite_response_head(
     tls: &StreamOwned<ServerConnection, TcpStream>,
     head: &[u8],
+    keep_alive: bool,
 ) -> Vec<u8> {
-    if head.len() < 4 {
-        return head.to_vec();
-    }
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let status = lines.next().unwrap_or("");
     let (version, cipher, alpn) = negotiated_params(tls);
 
-    let split = head.len() - 4;
-    let mut out = head[..split].to_vec();
-    out.extend_from_slice(format!("\r\nX-Negotiated-Version: {version}\r\n").as_bytes());
-    out.extend_from_slice(format!("X-Negotiated-Cipher: {cipher}\r\n").as_bytes());
-    out.extend_from_slice(format!("X-Negotiated-ALPN: {alpn}\r\n\r\n").as_bytes());
-    out
+    let mut out = String::from(status);
+    out.push_str("\r\n");
+    let mut expose: Option<String> = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if line.to_ascii_lowercase().starts_with("connection:") {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("access-control-expose-headers") {
+                expose = Some(value.trim().to_string());
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!("X-Negotiated-Version: {version}\r\n"));
+    out.push_str(&format!("X-Negotiated-Cipher: {cipher}\r\n"));
+    out.push_str(&format!("X-Negotiated-ALPN: {alpn}\r\n"));
+
+    let mut exposed = expose.unwrap_or_default();
+    for name in ["X-Negotiated-Version", "X-Negotiated-Cipher", "X-Negotiated-ALPN"] {
+        if !exposed.to_ascii_lowercase().contains(&name.to_ascii_lowercase()) {
+            if !exposed.is_empty() {
+                exposed.push_str(", ");
+            }
+            exposed.push_str(name);
+        }
+    }
+    out.push_str(&format!("Access-Control-Expose-Headers: {exposed}\r\n"));
+    out.push_str(if keep_alive {
+        "Connection: keep-alive\r\n\r\n"
+    } else {
+        "Connection: close\r\n\r\n"
+    });
+    out.into_bytes()
 }
 
 fn build_listener(spec: &ListenerSpec) -> Result<ListenerRuntime> {

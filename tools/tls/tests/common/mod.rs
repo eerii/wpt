@@ -113,6 +113,9 @@ pub fn profile_with_cert(cert_pem: &str, key_pem: &str) -> ProfileSpec {
         client_auth: ClientAuth::None,
         client_ca: None,
         cipher_suites: None,
+        key_exchange: None,
+        max_early_data: 0,
+        tls13_tickets: None,
     }
 }
 

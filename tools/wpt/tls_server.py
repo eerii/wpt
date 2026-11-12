@@ -22,7 +22,8 @@ import tarfile
 import tempfile
 import zipfile
 
-from .utils import get, get_download_to_descriptor, sha256sum
+from .httputils import get, get_download_to_descriptor
+from .utils import sha256sum
 
 here = os.path.dirname(__file__)
 wpt_root = os.path.abspath(os.path.join(here, os.pardir, os.pardir))
