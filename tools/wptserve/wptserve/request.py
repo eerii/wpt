@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 
 import base64
+import ipaddress
 import tempfile
 
 from http.cookies import BaseCookie
@@ -16,6 +17,32 @@ KT = TypeVar('KT')
 VT = TypeVar('VT')
 
 missing = object()
+
+
+def is_loopback(address):
+    """Whether a client address is loopback, including IPv4-mapped IPv6."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if parsed.version == 6 and parsed.ipv4_mapped:
+        parsed = parsed.ipv4_mapped
+    return parsed.is_loopback
+
+
+def forwarded_scheme(request_handler, scheme):
+    """The scheme the client used, when the TLS sidecar forwarded the request.
+
+    Trust comes from the harness, not the client: the browser is loopback too.
+    """
+    if not getattr(request_handler.server.config, "forwarded_proto", False):
+        return scheme
+    if not is_loopback(request_handler.client_address[0]):
+        return scheme
+    forwarded = request_handler.headers.get("X-Forwarded-Proto")
+    if forwarded in ("http", "https"):
+        return forwarded
+    return scheme
 
 
 class Server:
@@ -274,7 +301,7 @@ class Request:
         self._headers = None
         self.raw_headers = request_handler.headers
 
-        scheme = request_handler.scheme
+        scheme = forwarded_scheme(request_handler, request_handler.scheme)
         host = self.raw_headers.get("Host")
         port = request_handler.server.server_address[1]
 

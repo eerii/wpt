@@ -152,6 +152,7 @@ class ConfigBuilder:
             },
         },
         "aliases": [],
+        "forwarded_proto": False,
         "logging": {
             "level": "debug",
             "suppress_handler_traceback": False,
