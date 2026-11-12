@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>wptserve sees the scheme the sidecar terminated</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+promise_test(async () => {
+  const url = "https://{{host}}:{{ports[tls][0]}}/tls/resources/seen.py";
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (e) {
+    throw new OptionalFeatureUnsupportedError("the TLS sidecar is not running");
+  }
+
+  const seen = await response.json();
+  assert_equals(seen.scheme, "https",
+                "the backend sees the forwarded https scheme, not http");
+  assert_true(seen.url.startsWith("https://"),
+              "server side URLs stay https, so redirects and origins match");
+}, "the sidecar's X-Forwarded-Proto is honored by wptserve");
+
+promise_test(async () => {
+  // The allowlist is https/http only, so a junk value must not change the scheme.
+  const url = "http://{{host}}:{{ports[http][0]}}/tls/resources/seen.py";
+  const response = await fetch(url, {headers: {"X-Forwarded-Proto": "ftp"}});
+  const seen = await response.json();
+  assert_equals(seen.scheme, "http");
+}, "an unknown X-Forwarded-Proto value is ignored");
+</script>

@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Plaintext HTTP on the TLS port is never answered</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+promise_test(async () => {
+  const url = "https://{{host}}:{{ports[tls][0]}}/tls/resources/plaintext.py";
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (e) {
+    throw new OptionalFeatureUnsupportedError("the TLS sidecar is not running");
+  }
+
+  const probe = await response.json();
+  assert_false(probe.is_http,
+               "a plaintext request must not get an HTTP response back");
+}, "plaintext HTTP is not proxied to the backend");
+</script>
